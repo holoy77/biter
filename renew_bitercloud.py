@@ -19,7 +19,7 @@ from cryptography.fernet import Fernet, InvalidToken
 USER = os.environ.get("BITERCLOUD_USER", "").strip()
 PASS = os.environ.get("BITERCLOUD_PASS", "").strip()
 COOKIE = os.environ.get("BITERCLOUD_COOKIE", "").strip()
-SERVER_ID = (os.environ.get("BITERCLOUD_SERVER_ID") or "Oh1vni0cCpJ1GHW-4qZMj").strip()
+SERVER_ID = (os.environ.get("BITERCLOUD_SERVER_ID") or "3u9rmySGzA4ZxpGIqxYuA").strip()
 
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "").strip()
 TG_TOKEN = os.environ.get("TG_BOT_TOKEN", "").strip()
