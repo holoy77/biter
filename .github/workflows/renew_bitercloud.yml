@@ -1,0 +1,57 @@
+name: Bitercloud Server Auto Renew
+
+on:
+  schedule:
+    # 每 3 天自动运行一次 (每天 00:00 UTC 校验日期步长，相当于每 3 天一次)
+    - cron: "0 0 */3 * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bitercloud-auto-renew
+  cancel-in-progress: true
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout Bitercloud branch
+        uses: actions/checkout@v4
+        with:
+          ref: bitercloud
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python deps
+        run: pip install --upgrade pip requests "requests[socks]" cryptography
+
+      - name: Run Bitercloud Renew
+        env:
+          BITERCLOUD_USER: ${{ secrets.BITERCLOUD_USER }}
+          BITERCLOUD_PASS: ${{ secrets.BITERCLOUD_PASS }}
+          BITERCLOUD_COOKIE: ${{ secrets.BITERCLOUD_COOKIE }}
+          BITERCLOUD_SESSION_KEY: ${{ secrets.BITERCLOUD_SESSION_KEY }}
+          BITERCLOUD_SERVER_ID: ${{ secrets.BITERCLOUD_SERVER_ID }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: python renew_bitercloud.py
+
+      - name: Save Bitercloud session state
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add bitercloud_state.json || true
+          if git diff --cached --quiet; then
+            echo "No Bitercloud session state change."
+            exit 0
+          fi
+          git commit -m "Update Bitercloud session state [skip ci]"
+          git push origin HEAD:bitercloud
