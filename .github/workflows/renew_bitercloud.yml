@@ -18,10 +18,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Checkout Bitercloud branch
+      - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: bitercloud
           fetch-depth: 0
 
       - name: Setup Python
@@ -54,4 +53,4 @@ jobs:
             exit 0
           fi
           git commit -m "Update Bitercloud session state [skip ci]"
-          git push origin HEAD:bitercloud
+          git push origin HEAD:main
