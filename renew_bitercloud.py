@@ -2,9 +2,9 @@
 # -*- coding: utf-8 -*-
 """
 Bitercloud (https://dashboard.bitercloud.lat) 全自动登录与续期脚本
-- 采用 Hysteria 2 协议专用链路代理
-- 自动抓取 CtrlPanel /servers 页面中的服务器 ID 与续期表单
-- 自动提取并提交 CSRF Token，自动复用会话
+- 采用 Hysteria 2 协议专用链路代理 (127.0.0.1:10809)
+- 精准保持 Laravel 会话状态与 CSRF 校验
+- 自动解析 /servers 续期表单并提交
 """
 import os
 import sys
@@ -16,7 +16,6 @@ from cryptography.fernet import Fernet, InvalidToken
 
 USER = os.environ.get("BITERCLOUD_USER", "").strip()
 PASS = os.environ.get("BITERCLOUD_PASS", "").strip()
-COOKIE = os.environ.get("BITERCLOUD_COOKIE", "").strip()
 SERVER_ID = os.environ.get("BITERCLOUD_SERVER_ID", "").strip()
 CUSTOM_PROXY = os.environ.get("CUSTOM_PROXY", "").strip()
 
@@ -28,8 +27,6 @@ STATE_FILE = "bitercloud_state.json"
 BASE_URL = "https://dashboard.bitercloud.lat"
 LOGIN_URL = f"{BASE_URL}/login"
 SERVERS_URL = f"{BASE_URL}/servers"
-
-# HY2 启动后映射的本地代理地址
 HY2_LOCAL_PROXY = "http://127.0.0.1:10809"
 
 
@@ -87,41 +84,19 @@ def save_encrypted_cookies(state, cookies, s_id=""):
 
 def build_session():
     s = requests.Session()
-    # 只要存在 CUSTOM_PROXY，就使用后台跑起来的 HY2 本地映射端口
     if CUSTOM_PROXY:
         s.proxies = {"http": HY2_LOCAL_PROXY, "https": HY2_LOCAL_PROXY}
     s.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Accept-Language": "es-ES,es;q=0.9,en;q=0.8"
+        "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
     })
     return s
 
 
-def restore_cookies(state):
-    encrypted = state.get("encrypted_cookies")
-    if not encrypted or not SESSION_KEY:
-        return None
-    import json
-    try:
-        cookies = json.loads(Fernet(SESSION_KEY.encode()).decrypt(encrypted.encode()).decode())
-    except (InvalidToken, ValueError, TypeError):
-        return None
-
-    s = build_session()
-    for name, value in cookies.items():
-        s.cookies.set(name, value, domain="dashboard.bitercloud.lat", path="/")
-    xsrf = s.cookies.get("XSRF-TOKEN")
-    if xsrf:
-        s.headers["X-XSRF-TOKEN"] = urllib.parse.unquote(xsrf)
-    return s
-
-
 def parse_renew_targets(html_text):
-    """从 HTML 页面中解析续期 URL、服务器 ID 及提交方式"""
     results = []
-
-    # 1. 查找包含 renew 的 form 表单及其 action
+    # 匹配含有 renew 的 form 表单
     forms = re.findall(r'<form[^>]+action=[\'"]([^\'"]*servers/[^\'"]+/renew[^\'"]*)[\'"][^>]*>(.*?)</form>', html_text, re.DOTALL | re.IGNORECASE)
     for action, form_body in forms:
         url = urllib.parse.urljoin(BASE_URL, action)
@@ -133,14 +108,14 @@ def parse_renew_targets(html_text):
         token = token_match.group(1) if token_match else ""
         results.append({"url": url, "server_id": sid, "method": method, "token": token})
 
-    # 2. 正则查找 /servers/{id}/renew
+    # 匹配 /servers/{id}/renew
     if not results:
         direct_matches = re.findall(r'(/servers/([a-zA-Z0-9_-]+)/renew)', html_text)
         for path, sid in direct_matches:
             url = urllib.parse.urljoin(BASE_URL, path)
             results.append({"url": url, "server_id": sid, "method": "POST", "token": ""})
 
-    # 3. 兜底提取卡片或按钮里的 server ID
+    # 兜底匹配卡片 ID
     if not results:
         raw_ids = re.findall(r'/servers/([a-zA-Z0-9_-]{5,})', html_text)
         for sid in set(raw_ids):
@@ -165,14 +140,14 @@ def execute_renew(session, target):
     if session.cookies.get("XSRF-TOKEN"):
         headers["X-XSRF-TOKEN"] = urllib.parse.unquote(session.cookies.get("XSRF-TOKEN"))
 
-    # 方式 A: POST 表单携带 _method
+    # 1. 尝试 POST 表单
     payload = {"_token": token, "_method": target.get("method", "POST")}
     r = session.post(url, data=payload, headers=headers, allow_redirects=False, timeout=12)
-    log(f"   -> 提交续期表单 (POST): HTTP {r.status_code}, 跳转: {r.headers.get('Location')}")
+    log(f"   -> 提交续期请求 (POST): HTTP {r.status_code}, 跳转: {r.headers.get('Location')}")
     if r.status_code in (200, 302):
         return True, r.status_code, r.headers.get("Location")
 
-    # 方式 B: 直接发送 PATCH 请求
+    # 2. 尝试 PATCH 请求
     payload_patch = {"_token": token}
     r_patch = session.patch(url, data=payload_patch, headers=headers, allow_redirects=False, timeout=12)
     log(f"   -> 提交续期请求 (PATCH): HTTP {r_patch.status_code}, 跳转: {r_patch.headers.get('Location')}")
@@ -182,68 +157,29 @@ def execute_renew(session, target):
     return False, r.status_code, None
 
 
-def renew_with_saved_session(state):
-    target_id = SERVER_ID or state.get("server_id", "")
-    s = restore_cookies(state)
-    if s is None:
-        return False
-    try:
-        if not target_id:
-            res_servers = s.get(SERVERS_URL, timeout=12)
-            if res_servers.status_code == 200:
-                pairs = parse_renew_targets(res_servers.text)
-                if pairs:
-                    target_id = pairs[0]["server_id"]
-                else:
-                    return False
-            else:
-                return False
-
-        target = {"url": f"{BASE_URL}/servers/{target_id}/renew", "server_id": target_id, "method": "POST", "token": ""}
-        ok, status, loc = execute_renew(s, target)
-        if ok:
-            log(f"✅ Bitercloud 会话仍有效，服务器 ({target_id}) 续期成功！")
-            state["last_renew_time"] = now_str()
-            state["server_id"] = target_id
-            save_state(state)
-            return True
-    except Exception as exc:
-        log(f"⚠️ 已保存会话复用失败: {type(exc).__name__} - {exc}")
-    return False
-
-
 def main():
     log("=" * 50)
     log("⚡ Bitercloud 服务器自动登录续期启动")
     log(f"🕐 北京时间: {now_str()}")
     if CUSTOM_PROXY:
         log("🚀 代理通道: Hysteria 2 (127.0.0.1:10809)")
-    else:
-        log("⚠️ 未检测到代理通道，直接发起直连")
     log("=" * 50)
 
-    state = load_state()
-
-    # 1. 尝试复用保存的 Session
-    if renew_with_saved_session(state):
-        send_tg("✅ Bitercloud 复用会话续期成功！")
-        sys.exit(0)
-
-    # 2. 账号密码全自动登录
     if not (USER and PASS):
         log("❌ 缺少账号或密码配置，退出。")
         sys.exit(1)
 
+    state = load_state()
     s = build_session()
 
     try:
-        # A. 打开登录页
+        # 1. 打开登录页
         log(f"🌐 正在请求登录页: {LOGIN_URL} ...")
         r_get = s.get(LOGIN_URL, allow_redirects=False, timeout=15)
-        log(f"   登录页状态响应: HTTP {r_get.status_code}")
+        log(f"   登录页响应: HTTP {r_get.status_code}")
 
         if r_get.status_code == 403 or "blocked" in r_get.text.lower():
-            log("❌ 该 IP 被 BiterCloud 网关拦截 (Blocked/403)")
+            log("❌ 该节点被 BiterCloud 网关拦截 (Blocked/403)")
             sys.exit(1)
 
         token_match = re.search(r'name="_token"\s+value="([^"]+)"', r_get.text)
@@ -253,26 +189,36 @@ def main():
         if xsrf:
             s.headers["X-XSRF-TOKEN"] = urllib.parse.unquote(xsrf)
 
-        # B. 提交登录
-        payload = {"_token": token_val, "email": USER, "password": PASS}
+        # 2. 提交登录
+        payload = {
+            "_token": token_val,
+            "email": USER,
+            "password": PASS,
+            "remember": "on"
+        }
+        s.headers["Referer"] = LOGIN_URL
+        s.headers["Origin"] = BASE_URL
         log("🔑 正在提交登录凭据...")
         r_post = s.post(LOGIN_URL, data=payload, allow_redirects=False, timeout=15)
         loc = r_post.headers.get("Location", "")
-        log(f"   登录接口响应: HTTP {r_post.status_code}, 跳转到: {loc}")
+        log(f"   登录接口响应: HTTP {r_post.status_code}, 跳转目标: {loc}")
 
-        if r_post.status_code not in (200, 302) or f"{BASE_URL}/blocked" in loc:
-            log("❌ 登录失败，账号密码有误或被拦截。")
+        # 如果跳回 /login，说明账号密码错误或触发了风控
+        if loc.endswith("/login") or r_post.status_code == 200:
+            # 尝试抓取具体错误提示
+            r_err = s.get(LOGIN_URL, timeout=10)
+            err_box = re.findall(r'class="[^"]*(?:alert|invalid-feedback|error)[^"]*"[^>]*>(.*?)</div>', r_err.text, re.DOTALL)
+            clean_err = re.sub(r'<[^>]+>', '', err_box[0]).strip() if err_box else "凭证错误或被重定向拒绝"
+            log(f"❌ 登录失败！提示信息: {clean_err}")
+            log("👉 请检查 GitHub Secrets 中的 BITERCLOUD_USER 和 BITERCLOUD_PASS 是否与官网网页登录完全一致。")
             sys.exit(1)
 
-        new_xsrf = s.cookies.get("XSRF-TOKEN")
-        if new_xsrf:
-            s.headers["X-XSRF-TOKEN"] = urllib.parse.unquote(new_xsrf)
-
-        # C. 打开 /servers 页面解析服务器
+        # 3. 访问 /servers 页面
         log(f"🖥 正在获取服务器列表: {SERVERS_URL} ...")
+        s.headers["Referer"] = loc or BASE_URL
         r_servers = s.get(SERVERS_URL, timeout=15)
         if r_servers.status_code != 200:
-            log(f"❌ 打开控制台失败，HTTP {r_servers.status_code}")
+            log(f"❌ 访问控制台失败，HTTP {r_servers.status_code}")
             sys.exit(1)
 
         targets = parse_renew_targets(r_servers.text)
@@ -283,11 +229,11 @@ def main():
         target = targets[0]
         log(f"🎉 成功识别到服务器 ID: {target['server_id']}，续期地址: {target['url']}")
 
-        # D. 执行续期
+        # 4. 执行续期
         ok, status, redir = execute_renew(s, target)
         if ok:
             msg = (f"🎉 Bitercloud 服务器 ({target['server_id']}) 续期成功！\n"
-                   f"📌 协议: Hysteria 2\n"
+                   f"📌 节点: Hysteria 2\n"
                    f"🔄 状态: HTTP {status} -> {redir or 'Success'}")
             log(msg)
             send_tg(msg)
@@ -300,7 +246,7 @@ def main():
             sys.exit(1)
 
     except Exception as exc:
-        log(f"❌ 请求发生异常: {type(exc).__name__} - {exc}")
+        log(f"❌ 运行异常: {type(exc).__name__} - {exc}")
         sys.exit(1)
 
 
