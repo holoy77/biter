@@ -31,21 +31,26 @@ jobs:
         run: pip install --upgrade pip requests "requests[socks]" cryptography
 
       - name: Setup and Run Hysteria 2 (sing-box)
-        if: "${{ secrets.CUSTOM_PROXY != '' }}"
+        env:
+          CUSTOM_PROXY: ${{ secrets.CUSTOM_PROXY }}
         run: |
-          # 1. 下载并解压 sing-box
+          # 如果没有配置 CUSTOM_PROXY 则跳过代理启动
+          if [ -z "$CUSTOM_PROXY" ]; then
+            echo "CUSTOM_PROXY 未配置，跳过 HY2 启动"
+            exit 0
+          fi
+
+          echo "🚀 正在下载并配置 sing-box (HY2)..."
           curl -Lo sing-box.tar.gz https://github.com/SagerNet/sing-box/releases/download/v1.9.7/sing-box-1.9.7-linux-amd64.tar.gz
           tar -xzf sing-box.tar.gz
           sudo mv sing-box-*-linux-amd64/sing-box /usr/local/bin/
 
-          # 2. 将传入的 CUSTOM_PROXY 转换为 sing-box 出站配置
           python3 - << 'EOF'
           import os, json, urllib.parse
 
           uri = os.environ.get("CUSTOM_PROXY", "").strip()
-          # 兼容 hy2:// 或 hysteria2:// 链接格式
           parsed = urllib.parse.urlparse(uri)
-          auth = parsed.username or parsed.netloc.split("@")[0] if "@" in parsed.netloc else ""
+          auth = parsed.username or (parsed.netloc.split("@")[0] if "@" in parsed.netloc else "")
           host_port = parsed.netloc.split("@")[-1] if "@" in parsed.netloc else parsed.netloc
           server = host_port.split(":")[0]
           port = int(host_port.split(":")[1]) if ":" in host_port else 443
@@ -83,14 +88,9 @@ jobs:
               json.dump(config, f, indent=2)
           EOF
 
-          # 3. 后台运行 sing-box
           sing-box run -c sing-box.json &
           sleep 2
-
-          # 4. 验证本地代理转发是否打通
           curl -x http://127.0.0.1:10809 -I --connect-timeout 8 https://www.cloudflare.com || echo "Proxy init check completed."
-        env:
-          CUSTOM_PROXY: ${{ secrets.CUSTOM_PROXY }}
 
       - name: Run Bitercloud Renew
         env:
